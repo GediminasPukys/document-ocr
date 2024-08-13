@@ -1,53 +1,69 @@
 import streamlit as st
-from openai import OpenAI
+import requests
+import time
+import json
 
-# Show title and description.
-st.title("📄 Document question answering")
-st.write(
-    "Upload a document below and ask a question about it – GPT will answer! "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-)
+# API configuration
+API_URL = 'https://api.cloud.llamaindex.ai/api/v1/parsing/upload'
+API_KEY = 'llx-kHVYZKk7lHFXXL7QQ4S4ZPdvFqs1MypudZUYF4Jv6Jds7YTx'  # Consider using st.secrets for API keys
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+headers = {
+    'Accept': 'application/json',
+    'Authorization': f'Bearer {API_KEY}',
+}
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+# Streamlit UI
+st.title("📄 Document Parsing")
+st.write("Upload a document below for parsing!")
 
-    # Let the user upload a file via `st.file_uploader`.
-    uploaded_file = st.file_uploader(
-        "Upload a document (.txt or .md)", type=("txt", "md")
-    )
+uploaded_file = st.file_uploader("Upload a document (.pdf)", type=["pdf"])
 
-    # Ask the user for a question via `st.text_area`.
-    question = st.text_area(
-        "Now ask a question about the document!",
-        placeholder="Can you give me a short summary?",
-        disabled=not uploaded_file,
-    )
+if uploaded_file:
+    st.write("File uploaded successfully!")
 
-    if uploaded_file and question:
+    # Prepare the file for API request
+    file_bytes = uploaded_file.getvalue()
+    files = {
+        'language': (None, 'lt'),
+        'parsing_instruction': (None, 'File is an invoice. Parse invoice number, date, sender and receiver name, addresses, vat number, sum. Return only json with parsed key value pairs'),
+        'file': (uploaded_file.name, file_bytes, 'application/pdf'),
+        'bounding_box': (None, '0,0,0,0'),
+    }
 
-        # Process the uploaded file and question.
-        document = uploaded_file.read().decode()
-        messages = [
-            {
-                "role": "user",
-                "content": f"Here's a document: {document} \n\n---\n\n {question}",
-            }
-        ]
+    # Send request to API
+    if st.button("Parse Document"):
+        with st.spinner("Uploading and parsing the document..."):
+            try:
+                response = requests.post(API_URL, headers=headers, files=files)
+                response.raise_for_status()  # Raise an exception for bad status codes
 
-        # Generate an answer using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=messages,
-            stream=True,
-        )
+                # Get job ID
+                job_id = response.json()["id"]
+                st.success(f"Document uploaded! Job ID: {job_id}")
 
-        # Stream the response to the app using `st.write_stream`.
-        st.write_stream(stream)
+                # Check job status
+                status = "pending"
+                status_placeholder = st.empty()
+                while status != "SUCCESS":
+                    response_job_status = requests.get(
+                        f'https://api.cloud.llamaindex.ai/api/v1/parsing/job/{job_id}',
+                        headers=headers
+                    )
+                    response_job_status.raise_for_status()
+                    status = response_job_status.json()["status"]
+                    status_placeholder.text(f"Job status: {status}")
+                    if status != "SUCCESS":
+                        time.sleep(5)  # Wait for 5 seconds before checking again
+
+                # Get results
+                response_result = requests.get(
+                    f'https://api.cloud.llamaindex.ai/api/v1/parsing/job/{job_id}/result/json',
+                    headers=headers
+                )
+                response_result.raise_for_status()
+                st.success("Parsing completed successfully!")
+                json_string = response_result.json()["pages"][0]["items"][0]['value'].replace('```json\n', '').replace('\n```', '')
+                st.json(json.loads(json_string))
+
+            except requests.exceptions.RequestException as e:
+                st.error(f"An error occurred: {str(e)}")

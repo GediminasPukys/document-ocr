@@ -2,6 +2,9 @@ import streamlit as st
 import requests
 import time
 import json
+from PIL import Image
+import io
+import fitz  # PyMuPDF
 
 # API configuration
 API_URL = 'https://api.cloud.llamaindex.ai/api/v1/parsing/upload'
@@ -12,20 +15,59 @@ headers = {
     'Authorization': f'Bearer {API_KEY}',
 }
 
+
+def pdf_to_images(pdf_bytes):
+    images = []
+    pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    for page in pdf_document:
+        pix = page.get_pixmap()
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        images.append(img)
+    return images
+
+
 # Streamlit UI
 st.title("📄 Document Parsing")
 st.write("Upload a document below for parsing!")
 
-uploaded_file = st.file_uploader("Upload a document (.pdf)", type=["pdf"])
+uploaded_file = st.file_uploader("Upload a document (.pdf, .png, .jpg)", type=["pdf", 'png', 'jpg'])
 
 if uploaded_file:
     st.write("File uploaded successfully!")
 
     # Prepare the file for API request
     file_bytes = uploaded_file.getvalue()
+
+    parsing_instruction = """
+    File is an invoice. Parse the following fields:
+    - Invoice number
+    - Date
+    - Sender name
+    - Sender address
+    - Receiver name
+    - Receiver address
+    - VAT number
+    - Total sum
+
+    Validate the following fields against the provided values:
+    - Receiver name: "UAB Linėja transport"
+    - Receiver address: "Didžioji g. 38, Kėdainiai, LT-57257, Lithuania"
+    - VAT number: "LT100006144519"
+
+    For each validated field:
+    1. If the parsed value is similar or matches the provided value:
+       - Replace the parsed value with the provided value
+       - Add a field "[fieldname]_validated" with value "success"
+    2. If the parsed value is significantly different:
+       - Keep the original parsed value
+       - Add a field "[fieldname]_validated" with value "failed"
+
+    Return a JSON object with all parsed fields and their validation statuses.
+    """
+
     files = {
         'language': (None, 'lt'),
-        'parsing_instruction': (None, 'File is an invoice. Parse invoice number, date, sender and receiver name, addresses, vat number, sum. Return only json with parsed key value pairs'),
+        'parsing_instruction': (None, parsing_instruction),
         'file': (uploaded_file.name, file_bytes, 'application/pdf'),
         'bounding_box': (None, '0,0,0,0'),
     }
@@ -62,8 +104,36 @@ if uploaded_file:
                 )
                 response_result.raise_for_status()
                 st.success("Parsing completed successfully!")
-                json_string = response_result.json()["pages"][0]["items"][0]['value'].replace('```json\n', '').replace('\n```', '')
-                st.json(json.loads(json_string))
+                result_pages = response_result.json()["pages"]
+
+                # Convert PDF to images if it's a PDF file
+                if uploaded_file.type == "application/pdf":
+                    pdf_images = pdf_to_images(file_bytes)
+
+                for i, page in enumerate(result_pages):
+                    st.subheader(f"Page {i + 1}")
+
+                    # Create two columns
+                    col1, col2 = st.columns(2)
+
+                    with col1:
+                        st.subheader("Document Image")
+                        # Display the image
+                        if uploaded_file.type == "application/pdf":
+                            st.image(pdf_images[i], caption=f"Page {i + 1}", use_column_width=True)
+                        else:
+                            image = Image.open(io.BytesIO(file_bytes))
+                            st.image(image, caption=f"Page {i + 1}", use_column_width=True)
+
+                    with col2:
+                        st.subheader("Parsed Data")
+                        # Display parsed JSON
+                        json_string = page["items"][0]['value'].replace('```json\n', '').replace('\n```', '')
+                        parsed_data = json.loads(json_string)
+                        for key, value in parsed_data.items():
+                            st.write(f"**{key}:** {value}")
+
+                    st.markdown("---")  # Add a horizontal line for separation
 
             except requests.exceptions.RequestException as e:
                 st.error(f"An error occurred: {str(e)}")

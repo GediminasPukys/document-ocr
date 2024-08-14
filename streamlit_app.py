@@ -41,7 +41,7 @@ if uploaded_file:
     parsing_instruction = """
     File is an invoice. Parse the following fields:
     - Invoice number
-    - Date
+    - Invoice date
     - Sender name
     - Sender address
     - Receiver name
@@ -49,10 +49,12 @@ if uploaded_file:
     - VAT number
     - Total sum
 
-    Validate the following fields against the provided values:
+    Validate only the following fields against the provided values:
     - Receiver name: "UAB Linėja transport"
     - Receiver address: "Didžioji g. 38, Kėdainiai, LT-57257, Lithuania"
     - VAT number: "LT100006144519"
+    - Invoice date
+    - Total sum is a number
 
     For each validated field:
     1. If the parsed value is similar or matches the provided value:

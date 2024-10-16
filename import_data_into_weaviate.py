@@ -3,32 +3,37 @@ import pandas as pd
 import numpy as np
 import re
 import os
+import json
 from time import sleep
 from openai import OpenAI
+import weaviate
+from tqdm import tqdm
 
 client = OpenAI()
+
+# Weaviate client setup
+wcd_api_key = os.environ.get("WCS_API_KEY")
+wcd_url = 'https://doryjgsbqxaoy4efqu6iwq.c0.europe-west3.gcp.weaviate.cloud'
+
+weaviate_client = weaviate.Client(
+    url=wcd_url,
+    auth_client_secret=weaviate.AuthApiKey(api_key=wcd_api_key)
+)
 
 # Add a warning about OpenAI library version
 st.warning(
     "This script requires OpenAI library version 0.28. If you encounter errors, please run: pip install openai==0.28")
 
 
-# Load and clean data
 @st.cache_data
 def load_and_clean_data(file_path):
     df = pd.read_csv(file_path)
-
-    # Replace inf and -inf with a large number instead of NaN
     df = df.replace([np.inf, -np.inf], 1e10)
-
-    # Convert POPULARITY to int, replacing NaN with 0
     df['POPULARITY'] = df['POPULARITY'].fillna(0).astype(int)
-
     text_columns = ['LONG_NAME', 'SHORT_NAME', 'DESCRIPTION', 'SHORT_DESCRIPTION', 'KEYWORDS', 'CATEGORIES',
                     'LIFE_EVENTS', 'PROVIDER_NAMES']
     for col in text_columns:
         df[col] = df[col].fillna('').astype(str).str.strip()
-
     return df
 
 
@@ -73,26 +78,114 @@ def enrich_description_with_gpt(row):
         return row['DESCRIPTION']
 
 
-def manipulate_data(df):
-    df_manipulated = df.copy()
-    df_manipulated['COMBINED_NAME'] = df_manipulated.apply(concatenate_fields, axis=1)
-    df_manipulated['DESCRIPTION'] = df_manipulated.apply(
-        lambda row: row['DESCRIPTION'] + f" URL: {row['SHORT_NAME']}" if is_url(row['SHORT_NAME']) else row[
-            'DESCRIPTION'], axis=1)
-    df_manipulated['DESCRIPTION'] = df_manipulated.apply(
-        lambda row: row['DESCRIPTION'] + f" URL: {row['LONG_NAME']}" if is_url(row['LONG_NAME']) else row[
-            'DESCRIPTION'], axis=1)
-    return df_manipulated
+def enrich_and_save(df, start_index=0, output_dir="enriched_services"):
+    os.makedirs(output_dir, exist_ok=True)
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for index, row in tqdm(df.iloc[start_index:].iterrows(), total=len(df) - start_index):
+        try:
+            # Enrich the description
+            enriched_description = enrich_description_with_gpt(row)
+
+            # Prepare the data object
+            data_object = {
+                "iD": str(row["ID"]),
+                "LONG_NAME": row["LONG_NAME"],
+                "SHORT_NAME": row["SHORT_NAME"],
+                "DESCRIPTION": row["DESCRIPTION"],
+                "SHORT_DESCRIPTION": row["SHORT_DESCRIPTION"],
+                "KEYWORDS": row["KEYWORDS"],
+                "CATEGORIES": row["CATEGORIES"],
+                "LIFE_EVENTS": row["LIFE_EVENTS"],
+                "PROVIDER_NAMES": row["PROVIDER_NAMES"],
+                "POPULARITY": int(row["POPULARITY"]),
+                "COMBINED_NAME": row["COMBINED_NAME"],
+                "ENRICHED_DESCRIPTION": enriched_description
+            }
+
+            # Save to file
+            file_path = os.path.join(output_dir, f"{row['ID']}.json")
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(data_object, f, ensure_ascii=False, indent=4)
+
+            st.write(f"Saved enriched data for ID {row['ID']}")
+
+        except Exception as e:
+            st.error(f"Error processing row {index} (ID: {row['ID']}): {str(e)}")
+            continue
+
+        # Update progress
+        progress = (index - start_index + 1) / (len(df) - start_index)
+        progress_bar.progress(progress)
+        status_text.text(f"Processed {index - start_index + 1} out of {len(df) - start_index} rows")
+
+        # Save progress every 10 rows
+        if (index - start_index + 1) % 10 == 0:
+            st.session_state.last_processed_index = index
+
+    status_text.text("Enrichment and saving completed!")
 
 
-def enrich_selected_description(df, selected_index):
-    df_enriched = df.copy()
-    df_enriched.at[selected_index, 'DESCRIPTION'] = enrich_description_with_gpt(df_enriched.loc[selected_index])
-    return df_enriched
+def create_weaviate_schema():
+    schema = {
+        "class": "ServiceDescription",
+        "vectorizer": "none",
+        "properties": [
+            {"name": "iD", "dataType": ["string"]},
+            {"name": "LONG_NAME", "dataType": ["text"]},
+            {"name": "SHORT_NAME", "dataType": ["text"]},
+            {"name": "DESCRIPTION", "dataType": ["text"]},
+            {"name": "SHORT_DESCRIPTION", "dataType": ["text"]},
+            {"name": "KEYWORDS", "dataType": ["text"]},
+            {"name": "CATEGORIES", "dataType": ["text"]},
+            {"name": "LIFE_EVENTS", "dataType": ["text"]},
+            {"name": "PROVIDER_NAMES", "dataType": ["text"]},
+            {"name": "POPULARITY", "dataType": ["int"]},
+            {"name": "COMBINED_NAME", "dataType": ["text"]},
+            {"name": "ENRICHED_DESCRIPTION", "dataType": ["text"]}
+        ]
+    }
+    weaviate_client.schema.create_class(schema)
+
+
+def upload_to_weaviate(input_dir="enriched_services"):
+    if not weaviate_client.schema.exists("ServiceDescription"):
+        create_weaviate_schema()
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    file_list = os.listdir(input_dir)
+    for i, filename in enumerate(file_list):
+        if filename.endswith('.json'):
+            file_path = os.path.join(input_dir, filename)
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data_object = json.load(f)
+
+                # Upload to Weaviate
+                weaviate_client.data_object.create(
+                    class_name="ServiceDescription",
+                    data_object=data_object
+                )
+                st.write(f"Uploaded record for ID {data_object['iD']}")
+
+            except Exception as e:
+                st.error(f"Error uploading file {filename}: {str(e)}")
+                continue
+
+        # Update progress
+        progress = (i + 1) / len(file_list)
+        progress_bar.progress(progress)
+        status_text.text(f"Processed {i + 1} out of {len(file_list)} files")
+
+    status_text.text("Upload to Weaviate completed!")
 
 
 def main():
-    st.title("Service Description Data Manipulation and Enrichment Viewer (Using OpenAI GPT)")
+    st.title("Service Description Data Enrichment and Weaviate Upload")
 
     file_path = "CC_QUICKSTART_CORTEX_DOCS_DATA_SERVICES.csv"
     if not os.path.exists(file_path):
@@ -101,48 +194,26 @@ def main():
 
     # Load and manipulate data
     df_original = load_and_clean_data(file_path)
-    df_manipulated = manipulate_data(df_original)
+    df_manipulated = df_original.copy()
+    df_manipulated['COMBINED_NAME'] = df_manipulated.apply(concatenate_fields, axis=1)
 
-    # Print out initial file
-    st.subheader("File Contents")
-    st.dataframe(df_manipulated)
+    # Display the number of rows
+    st.info(f"Total number of rows: {len(df_manipulated)}")
 
-    # Select line to enrich
-    selected_index = st.number_input("Select line number to enrich (0-based index)",
-                                     min_value=0,
-                                     max_value=len(df_manipulated) - 1,
-                                     value=0)
+    # Initialize session state for last processed index
+    if 'last_processed_index' not in st.session_state:
+        st.session_state.last_processed_index = 0
 
-    if st.button("Enrich Selected Line"):
-        with st.spinner("Enriching description with GPT..."):
-            df_enriched = enrich_selected_description(df_manipulated, selected_index)
+    # Enrich and save data
+    if st.button("Start/Resume Enrichment and Saving"):
+        enrich_and_save(df_manipulated, st.session_state.last_processed_index)
 
-        st.subheader(f"Enriched Data for Line {selected_index}")
+    # Upload to Weaviate
+    if st.button("Upload Enriched Data to Weaviate"):
+        upload_to_weaviate()
 
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.write("**Original Data**")
-            st.write(f"SHORT_NAME: {df_original.loc[selected_index, 'SHORT_NAME']}")
-            st.write(f"LONG_NAME: {df_original.loc[selected_index, 'LONG_NAME']}")
-            st.write(f"PROVIDER_NAMES: {df_original.loc[selected_index, 'PROVIDER_NAMES']}")
-            st.write(f"DESCRIPTION: {df_original.loc[selected_index, 'DESCRIPTION']}")
-            st.write(f"CATEGORIES: {df_original.loc[selected_index, 'CATEGORIES']}")
-            st.write(f"LIFE_EVENTS: {df_original.loc[selected_index, 'LIFE_EVENTS']}")
-
-        with col2:
-            st.write("**Enriched Data**")
-            st.write(f"COMBINED_NAME: {df_enriched.loc[selected_index, 'COMBINED_NAME']}")
-            st.write(f"ENRICHED DESCRIPTION: {df_enriched.loc[selected_index, 'DESCRIPTION']}")
-            st.write(f"CATEGORIES: {df_enriched.loc[selected_index, 'CATEGORIES']}")
-            st.write(f"LIFE_EVENTS: {df_enriched.loc[selected_index, 'LIFE_EVENTS']}")
-
-        # Highlight changes
-        if df_original.loc[selected_index, 'DESCRIPTION'] != df_enriched.loc[selected_index, 'DESCRIPTION']:
-            st.info("The DESCRIPTION field has been enriched by GPT.")
-        if is_url(df_original.loc[selected_index, 'SHORT_NAME']) or is_url(
-                df_original.loc[selected_index, 'LONG_NAME']):
-            st.info("A URL was detected and added to the DESCRIPTION.")
+    # Display last processed index
+    st.write(f"Last processed index: {st.session_state.last_processed_index}")
 
 
 if __name__ == "__main__":
